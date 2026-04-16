@@ -126,7 +126,8 @@ class ResNet2(nn.Module):
         num_classes       = getattr(args, 'num_classes', 23)
 
         # Pretrained ResNet50, fc removed
-        backbone = tv_models.resnet50(pretrained=True)
+        # backbone = tv_models.resnet50(pretrained=True) 37
+        backbone = tv_models.resnet50(weights=tv_models.ResNet50_Weights.IMAGENET1K_V1)
         self.backbone = nn.Sequential(*list(backbone.children())[:-1])
         # backbone output: [B, 2048, 1, 1]
 

@@ -33,29 +33,12 @@ def main(args):
         key=lambda x: int(x)
     )
 
-    num_classes = len(class_folders)
-    print(f"Found {num_classes} class folders: {class_folders}")
+    print(f"Found {len(class_folders)} class folders: {class_folders}")
 
-    # Build remapping: contiguous label → original folder name
-    label_to_folder = {idx: folder for idx, folder in enumerate(class_folders)}
-    folder_to_label = {folder: idx for idx, folder in enumerate(class_folders)}
-
-    # Save class mapping file
-    mapping_path = os.path.join(args.out_dir, 'class_mapping.txt')
-    with open(mapping_path, 'w') as f:
-        f.write(f"{'Label':<8} {'Folder':<10} {'OriginalClass':<15}\n")
-        f.write("-" * 35 + "\n")
-        for idx, folder in enumerate(class_folders):
-            f.write(f"{idx:<8} {folder:<10} {folder:<15}\n")
-    print(f"Class mapping saved to {mapping_path}")
-    print(f"\n{'Label':<8} {'Folder':<10}")
-    for idx, folder in enumerate(class_folders):
-        print(f"  {idx:<8} {folder:<10}")
-
+    # First pass — sample all GLBs and collect triplets per class
     all_triplets_per_class = {}
 
     for cls_folder in class_folders:
-        label         = folder_to_label[cls_folder]   # contiguous 0-based
         mesh_cls_dir  = os.path.join(args.mesh_root,  cls_folder)
         image_cls_dir = os.path.join(args.image_root, cls_folder)
         npy_cls_dir   = os.path.join(args.npy_root,   cls_folder)
@@ -84,7 +67,6 @@ def main(args):
                 print(f"  Skipping {npy_path} (exists)")
 
             if not os.path.isdir(image_cls_dir):
-                print(f"  WARNING: image dir not found: {image_cls_dir}")
                 continue
 
             image_files = os.listdir(image_cls_dir)
@@ -99,23 +81,55 @@ def main(args):
                 triplets.append((
                     os.path.abspath(npy_path),
                     os.path.abspath(img_path),
-                    label,
-                    cls_folder   # original folder name stored for reference
+                    cls_folder   # store folder name, label assigned after filtering
                 ))
 
-        print(f"Class folder {cls_folder} → label {label}: "
-              f"{len(triplets)} triplets")
         all_triplets_per_class[cls_folder] = triplets
+        print(f"  Class folder {cls_folder}: {len(triplets)} triplets")
 
-    # Stratified split
+    # Second pass — filter out classes with 0 triplets and remap labels
+    valid_folders = [
+        f for f in class_folders
+        if len(all_triplets_per_class[f]) > 0
+    ]
+    skipped_folders = [
+        f for f in class_folders
+        if len(all_triplets_per_class[f]) == 0
+    ]
+
+    print(f"\nSkipping folders with no image pairs: {skipped_folders}")
+    print(f"Valid folders ({len(valid_folders)}): {valid_folders}")
+
+    # Assign contiguous labels only to valid folders
+    folder_to_label = {folder: idx for idx, folder in enumerate(valid_folders)}
+    num_classes     = len(valid_folders)
+
+    # Save class mapping file
+    mapping_path = os.path.join(args.out_dir, 'class_mapping.txt')
+    with open(mapping_path, 'w') as f:
+        f.write(f"{'Label':<8} {'Folder':<10} {'OriginalClass':<15}\n")
+        f.write("-" * 35 + "\n")
+        for idx, folder in enumerate(valid_folders):
+            f.write(f"{idx:<8} {folder:<10} {folder:<15}\n")
+    print(f"\nClass mapping saved to {mapping_path}")
+    print(f"\n{'Label':<8} {'Folder':<10}")
+    for idx, folder in enumerate(valid_folders):
+        print(f"  {idx:<8} {folder:<10}")
+
+    # Rebuild triplets with correct contiguous labels
     train_all, val_all, test_all = [], [], []
     summary_lines = [
         f"{'Folder':<10} {'Label':<8} {'Train':>8} "
         f"{'Val':>8} {'Test':>8} {'Total':>8}"
     ]
 
-    for cls_folder in class_folders:
-        triplets = all_triplets_per_class[cls_folder]
+    for cls_folder in valid_folders:
+        label    = folder_to_label[cls_folder]
+        triplets = [
+            (npy_p, img_p, label, orig_folder)
+            for npy_p, img_p, orig_folder in all_triplets_per_class[cls_folder]
+        ]
+
         np.random.seed(42)
         indices = np.random.permutation(len(triplets))
         n       = len(triplets)
@@ -130,9 +144,8 @@ def main(args):
         val_all.extend(val)
         test_all.extend(test)
 
-        lbl = folder_to_label[cls_folder]
         summary_lines.append(
-            f"{cls_folder:<10} {lbl:<8} {len(train):>8} "
+            f"{cls_folder:<10} {label:<8} {len(train):>8} "
             f"{len(val):>8} {len(test):>8} {n:>8}"
         )
 
@@ -143,7 +156,7 @@ def main(args):
         f"{len(train_all)+len(val_all)+len(test_all):>8}"
     )
 
-    # Write split files — each line: npy_path,image_path,label,original_folder
+    # Write split files
     def write_split(path, triplets):
         with open(path, 'w') as f:
             for npy_p, img_p, lbl, orig_folder in triplets:
@@ -159,7 +172,8 @@ def main(args):
 
     print('\n' + '\n'.join(summary_lines))
     print(f"\nSplits written to {args.out_dir}")
-    print(f"Total classes: {num_classes}")
+    print(f"Total valid classes: {num_classes}")
+    print(f"Skipped classes (no images): {skipped_folders}")
     print(f"Use --num_classes {num_classes} in all training and test commands")
 
 

@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader
 import wandb
 
 from datasets.radar_dataset import MeshImagePairDataset, get_transforms
-from models.dgcnn import DGCNN, ResNet
+from models.dgcnn2 import DGCNN2 as DGCNN, ResNet2 as ResNet
 from pytorch_metric_learning.losses import SupConLoss
 from util import IOStream, AverageMeter
 
