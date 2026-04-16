@@ -1,0 +1,204 @@
+Documentation style name: TOP_LEVEL
+Characteristics: section headers in caps, bullet points only, no paragraphs, key decisions marked with KEY, file names in brackets, shapes in square brackets, arrows for data flow.
+
+================================================================================
+SUPERVISED CROSS-MODAL CONTRASTIVE LEARNING
+3D Mesh and 2D Image Shared Latent Space
+================================================================================
+
+PROJECT GOAL
+------------
+- Learn shared latent space between 3D meshes and 2D images
+- Same class pair  → dot product → 1
+- Diff class pair  → dot product → 0
+- Base: CrossPoint (CVPR 2022), unsupervised → supervised
+
+================================================================================
+DATASET
+================================================================================
+- 23 classes, folders named 1–23, internal labels 0–22
+- Meshes: GLB format, one or more per class folder
+- Images: 256×256 RGB, named {glb_stem}_{count}.ext
+- One GLB maps to multiple images, all are valid pairs
+
+================================================================================
+STEP 1 — GENERATE SPLITS  [prepare_splits.py]
+================================================================================
+- For each class folder scan mesh root for GLB files
+- For each GLB:
+    · Load as trimesh scene → merge all geometries → single mesh
+    · Sample 2048 points from surface (once, seed=42)
+    · Center at origin, scale to unit sphere
+    · Save as {glb_stem}.npy in npy_root mirroring class structure
+- Skip npy generation if file already exists (safe to re-run)
+- For each GLB find all images whose name starts with {glb_stem}_
+- Each matched (npy_path, image_path, label) is one triplet
+- Shuffle per class with seed 42
+- Split per class: 70% train / 20% val / 10% test (stratified)
+- Write splits/train.txt, val.txt, test.txt
+- Each line: /abs/npy/path,/abs/image/path,label
+- Write splits/split_summary.txt with counts per class per split
+
+================================================================================
+STEP 2 — DATA LOADING  [datasets/mesh_image_dataset.py]
+================================================================================
+- Read split txt file → list of (npy_path, image_path, label)
+- Per point cloud at load time:
+    · Load .npy → [2048, 3] float32 tensor
+    · Train only augmentations:
+        · Random jitter: Gaussian noise (mean=0, std=0.02, clamp ±0.05)
+        · Random scale: uniform random in [0.8, 1.2]
+- Per image: load RGB, apply transform → [3, 256, 256]
+- Train transforms: Resize 256, ColorJitter, RandomHFlip, Normalize
+- Val/Test transforms: Resize 256, Normalize only
+
+================================================================================
+STEP 3 — MODEL ARCHITECTURE  [models/dgcnn.py]
+================================================================================
+
+3D ENCODER (DGCNN)
+- Input [B, 3, 2048]
+- 4× EdgeConv layers (k=20) → concat → global max+mean pool
+- MLP projection: 2048→512→256 + BN + ReLU
+- F.normalize(dim=1) → z_3d [B, 256] unit vector
+
+2D ENCODER (ResNet50, shared backbone)
+- Input [B, 3, 256, 256]
+- Pretrained ResNet50, fc removed → feature [B, 2048]
+- Head A — contrastive: Linear 2048→512→256 + BN + ReLU + F.normalize
+  → z_2d [B, 256] unit vector
+- Head B — classifier (optional): Linear 2048→256→23 + ReLU + Dropout(0.5)
+  → logits [B, 23]
+- Forward returns (z_2d, logits) or (z_2d, None)
+
+KEY: F.normalize on both encoders → dot product = cosine similarity
+
+================================================================================
+STEP 4 — TRAINING  [train_supervised.py]
+================================================================================
+
+HYPERPARAMETERS
+- batch_size=16, epochs=100, lr=1e-3, weight_decay=1e-4
+- temperature=0.1, proj_dim=256, lambda_cls=0.5, num_classes=23
+
+LOSS
+- Concatenate [z_3d, z_2d] → [2B, 256], labels → [2B]
+- L_supcon = SupConLoss(embeddings, labels_cat)
+- L_ce = CrossEntropyLoss(logits, labels)  if cls head enabled
+- L_total = L_supcon + 0.5 × L_ce
+
+OPTIMIZATION
+- Adam + CosineAnnealingLR + grad clip norm 1.0
+- Save best_3d_encoder.pth and best_2d_encoder.pth on best val loss
+- Save last_3d_encoder.pth and last_2d_encoder.pth at end
+
+LOGGING (wandb per epoch)
+- train/val loss total, supcon, ce
+- val top-1 acc (if cls head)
+- learning rate
+
+KEY: SupConLoss over NTXentLoss — uses class labels so all same-class
+     pairs attract, not just the single paired instance
+
+================================================================================
+STEP 5 — FEATURE STORE  [build_feature_store.py]
+================================================================================
+- Load best_3d_encoder.pth
+- For every unique npy file across all splits:
+    · Load .npy → [2048, 3] → permute → [1, 3, 2048]
+    · Pass through 3D encoder → [256] unit vector
+- Store per entry: {vector, label, class_name, npy_path, glb_path}
+- Save as feature_store.pkl
+- Print total entries and count per class
+
+KEY: One vector per GLB (via its pre-sampled npy) → deterministic storage
+
+================================================================================
+STEP 6 — TEST MODE 1: RETRIEVAL  [test_retrieval.py]
+================================================================================
+- Load feature_store.pkl → gallery matrix [N, 256]
+- Per query image:
+    · 2D encoder → z_query [256]
+    · scores = gallery @ z_query  (dot product all N entries)
+    · top-5 = argsort descending [:5]
+    · predicted class = label of rank-1 match
+    · display: rank, class name, score, glb path
+- Full test eval metrics:
+    · Top-1 accuracy, Top-5 accuracy
+    · Per-class accuracy
+    · Confusion matrix → confusion_matrix_retrieval.png
+
+KEY: Gallery uses all splits — simulates real indexed 3D asset database
+
+================================================================================
+STEP 7 — TEST MODE 2: CLASSIFICATION  [test_classification.py]
+================================================================================
+- Requires model trained with --use_cls_head
+- Per query image:
+    · 2D encoder → logits [23] → softmax → probs
+    · Display top-5: class name, confidence %
+- Full test eval metrics:
+    · Top-1 accuracy, Top-5 accuracy
+    · Per-class accuracy
+    · F1 score: macro, weighted, and per-class
+    · Confusion matrix → confusion_matrix_classification.png
+
+KEY: Single forward pass, no feature store needed
+
+================================================================================
+EXECUTION ORDER
+================================================================================
+1. conda create -n crosspoint_sup python=3.8
+   pip install torch torchvision (match CUDA version)
+   pip install trimesh[easy] pytorch-metric-learning wandb scikit-learn matplotlib
+
+2. git clone https://github.com/MohamedAfham/CrossPoint.git
+
+3. Add files:
+   · datasets/mesh_image_dataset.py  (new)
+   · models/dgcnn.py                 (patch: add F.normalize)
+   · prepare_splits.py               (new)
+   · train_supervised.py             (new)
+   · build_feature_store.py          (new)
+   · test_retrieval.py               (new)
+   · test_classification.py          (new)
+
+4. python prepare_splits.py \
+       --mesh_root  /path/to/mesh_root \
+       --image_root /path/to/image_root \
+       --npy_root   /path/to/npy_root \
+       --out_dir    splits/
+   → verify splits/split_summary.txt looks correct
+
+5. Sanity check data loading:
+   · point cloud shape = [2048, 3]
+   · image shape       = [3, 256, 256]
+   · labels in range   = 0–22
+
+6. python train_supervised.py \
+       --train_split splits/train.txt \
+       --val_split   splits/val.txt \
+       --exp_name    sup_v1
+
+7. python build_feature_store.py \
+       --train_split splits/train.txt \
+       --val_split   splits/val.txt \
+       --test_split  splits/test.txt \
+       --checkpoint  checkpoints/sup_v1/best_3d_encoder.pth \
+       --out         feature_store.pkl
+
+8. python test_retrieval.py       (mode 1)
+   python test_classification.py  (mode 2)
+
+================================================================================
+
+python3 -c "
+import trimesh, numpy as np
+scene = trimesh.load('/home/imfeynman/fAInman_labs/auric_ai/Chinese_GLBs/Chinese_GLBs/CHL906.glb', force='scene')
+mesh  = trimesh.util.concatenate(
+    [trimesh.Trimesh(vertices=g.vertices, faces=g.faces)
+     for g in scene.geometry.values()])
+pts, _ = trimesh.sample.sample_surface(mesh, 2048)
+print('Points shape:', pts.shape)
+print('GLB loading OK')
+"
